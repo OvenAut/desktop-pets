@@ -1,0 +1,35 @@
+{
+  "name": "raumschiff-desktop-pet",
+  "productName": "Raumschiff",
+  "version": "0.1.0",
+  "description": "Desktop-Haustier für Windows: ein Raketen-Raumschiff, das startet, den Mauszeiger angreift und zum Aufladen wieder landet – three.js (WebGPU) und TSL",
+  "main": "main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable nsis"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "de.oo75.raumschiff",
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "index.html",
+      "src/**/*",
+      "node_modules/three/build/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ]
+    }
+  }
+}
