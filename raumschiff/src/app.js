@@ -1,25 +1,32 @@
-// Verhalten des Raumschiffs: auf dem Startplatz laden, starten, den Mauszeiger jagen und beschießen,
-// bei leerem Akku zurückfliegen und landen. Das Fenster fliegt mit, das Schiff sitzt immer in der Mitte.
+// Verhalten des Raumschiffs: wartet unsichtbar im Hangar (Fenster 1 × 1 Pixel) und lädt. Steht der
+// Mauszeiger lange still, fährt es auf einem Lift von unten herauf, startet, jagt und beschießt den
+// Mauszeiger, fliegt bei leerem Akku zurück, landet auf dem Lift und fährt wieder hinunter.
 import * as THREE from 'three/webgpu';
-import { createScene, shipUniforms as U, SHIP_BOTTOM, PAD_HEIGHT } from './ship.js';
+import { createScene, shipUniforms as U, SHIP_BOTTOM, NOSE } from './ship.js';
+
+const params = new URLSearchParams(location.search);
 
 // ---------------------------------------------------------------------------
 // Einstellungen
 // ---------------------------------------------------------------------------
-const VIEW_WIDTH = 5;             // sichtbare Breite in Welteinheiten (Rakete ≈ 1,5 hoch)
-const CHARGE_TIME = 15;           // Sekunden von leer bis voll
-const LAUNCH_DELAY = [8, 40];     // so lange wartet es vollgeladen bis zum Start (Sekunden)
+const VIEW_WIDTH = 5;             // sichtbare Breite in Welteinheiten (Schiff ≈ 2 lang)
+const IDLE_TRIGGER = Number(params.get('idle')) || 5 * 60;   // so lange muss der Mauszeiger stillstehen (s)
+const IDLE_TOLERANCE = 3;         // kleinere Bewegungen (Pixel) zählen nicht als Bewegung
+const CHARGE_TIME = 15;           // Sekunden von leer bis voll (lädt im Hangar)
+const LIFT_SPEED = 120;           // Pixel pro Sekunde
+const LIFT_RISE = 45;             // so weit fährt der Lift über die Taskleiste hinaus (Pixel)
 const FLIGHT_DRAIN = 0.025;       // Akkuverbrauch pro Sekunde im Flug
 const SHOT_COST = 0.015;          // Akkuverbrauch pro Schuss
-const RETURN_AT = 0.15;           // darunter fliegt es zurück zur Basis
+const RETURN_AT = 0.15;           // darunter fliegt es zurück zum Lift
 const MAX_SPEED = 480;            // Pixel pro Sekunde
-const ORBIT_RADIUS = 120;         // Abstand zum Mauszeiger beim Angriff
-const FIRE_RANGE = 200;
+const ORBIT_RADIUS = 130;         // Abstand zum Mauszeiger beim Angriff
+const FIRE_RANGE = 210;
 const LASER_SPEED = 900;
 const BURST = 3;                  // Schüsse pro Salve
 const BURST_GAP = 0.12;
 const BURST_PAUSE = 0.9;
-const TURN_RATE = 7;              // Drehgeschwindigkeit (rad/s)
+const TURN_RATE = 6;              // Drehgeschwindigkeit (rad/s)
+const LIFT_VIEW_OFFSET = 90;      // bei Lift-Szenen sitzt das Schiff höher im Fenster, damit der Lift zu sehen ist
 
 // ---------------------------------------------------------------------------
 // Host: Electron (über preload.cjs) oder – zum Ausprobieren – ein normaler Browser
@@ -30,30 +37,34 @@ const SIZE = info.size;
 const PX = SIZE / VIEW_WIDTH;     // Pixel pro Welteinheit
 
 function createBrowserHost() {
-    // Im Browser ist das Seitenfenster der "Bildschirm" und die Zeichenfläche das Pet-Fenster
-    const size = 300;
+    // Im Browser ist das Seitenfenster der "Bildschirm" (unten 40 px "Taskleiste")
+    const size = 300, taskbar = 40;
     let cursorFn = () => {};
     let commandFn = () => {};
-    const area = () => ({ x: 0, y: 0, width: innerWidth, height: innerHeight });
+    const bounds = () => ({ x: 0, y: 0, width: innerWidth, height: innerHeight });
+    const area = () => ({ x: 0, y: 0, width: innerWidth, height: innerHeight - taskbar });
+    const canvas = () => document.querySelector('canvas');
     addEventListener('pointermove', (e) => cursorFn({ x: e.clientX, y: e.clientY }));
     addEventListener('keydown', (e) => {
-        const map = { l: 'launch', b: 'land', h: 'home' };
+        const map = { l: 'launch', b: 'land' };
         if (map[e.key]) commandFn(map[e.key]);
     });
     document.body.style.background = 'linear-gradient(#5b6b88, #2b3242)';
+    const bar = document.createElement('div');
+    Object.assign(bar.style, { position: 'fixed', left: 0, right: 0, bottom: 0, height: `${taskbar}px`, background: '#1b1f29' });
+    document.body.appendChild(bar);
     return {
         browser: true,
-        info: async () => ({ x: innerWidth * 0.3 - size / 2, y: innerHeight - size, size }),
+        info: async () => ({ x: 0, y: 0, size }),
         move: (x, y) => {
-            const c = document.querySelector('canvas');
-            if (c) { c.style.left = `${Math.round(x)}px`; c.style.top = `${Math.round(y)}px`; }
+            const c = canvas();
+            if (c) Object.assign(c.style, { display: 'block', left: `${Math.round(x)}px`, top: `${Math.round(y)}px` });
         },
-        ignoreMouse: (ignore) => {
-            const c = document.querySelector('canvas');
-            if (c) c.style.pointerEvents = ignore ? 'none' : 'auto';
-        },
+        hide: () => { const c = canvas(); if (c) c.style.display = 'none'; },
+        ignoreMouse: (ignore) => { const c = canvas(); if (c) c.style.pointerEvents = ignore ? 'none' : 'auto'; },
         contextMenu: () => {},
         workArea: async () => area(),
+        displayBounds: async () => bounds(),
         displays: async () => [area()],
         onCursor: (fn) => { cursorFn = fn; },
         onCommand: (fn) => { commandFn = fn; }
@@ -64,12 +75,11 @@ function createBrowserHost() {
 // Szene
 // ---------------------------------------------------------------------------
 // ?webgl in der Adresse (bzw. RAUMSCHIFF_WEBGL=1 beim Start) erzwingt WebGL 2, falls WebGPU zickt
-const forceWebGL = new URLSearchParams(location.search).has('webgl');
-const renderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL });
+const renderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: params.has('webgl') });
 renderer.setPixelRatio(devicePixelRatio);
 renderer.setSize(SIZE, SIZE);
 renderer.setClearColor(0x000000, 0);
-if (host.browser) Object.assign(renderer.domElement.style, { position: 'absolute', left: '0px', top: '0px', pointerEvents: 'none' });
+if (host.browser) Object.assign(renderer.domElement.style, { position: 'absolute', display: 'none', pointerEvents: 'none', zIndex: 1 });
 document.body.appendChild(renderer.domElement);
 await renderer.init();
 console.log(`Raumschiff rendert mit ${renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2'}`);
@@ -80,50 +90,69 @@ const camera = new THREE.OrthographicCamera(-half, half, half, -half, 0.1, 50);
 camera.position.set(0, 0, 10);
 
 const fx = createScene();
-const { rocket, pad } = fx;
-scene.add(rocket.ship, pad);
+const { freighter, lift: liftMesh } = fx;
+scene.add(freighter.ship, liftMesh);
 
 // ---------------------------------------------------------------------------
 // Zustand (alles in Bildschirmpixeln)
 // ---------------------------------------------------------------------------
-let area = await host.workArea(info.x + SIZE / 2, info.y + SIZE / 2);
+let area = await host.workArea(0, 0);
+let display = await host.displayBounds(0, 0);
 let allAreas = await host.displays();
-const home = { x: info.x + SIZE / 2 };
-const groundY = () => area.y + area.height;
-const landedY = () => groundY() - (SHIP_BOTTOM + PAD_HEIGHT) * PX;
+const groundY = () => area.y + area.height;                 // Oberkante Taskleiste
+const liftTopY = () => groundY() - LIFT_RISE;               // hier hält der Lift oben
+const hiddenY = () => display.y + display.height + 40;      // so tief ist der Lift samt Schiff verschwunden
+const onLiftY = () => lift.y - SHIP_BOTTOM * PX;            // Schiffsmitte, wenn es auf der Plattform steht
 
-const ship = { x: home.x, y: landedY(), vx: 0, vy: 0, angle: 0, spin: 0 };
-const cursor = { x: home.x, y: groundY() - 300 };
-const win = { x: NaN, y: NaN };
+const lift = { x: 0, y: 0 };
+const ship = { x: 0, y: 0, vx: 0, vy: 0, angle: 0, spin: 0, present: 0, bank: 0 };
+const cursor = { x: 0, y: 0 };
+const win = { x: NaN, y: NaN, offset: LIFT_VIEW_OFFSET };
 
-let state = 'charging';
+let state = 'hidden';
 let stateTime = 0;
-let energy = 0.6;
-let launchAt = Infinity;
-let relocate = false;          // nach dem Start direkt zum neuen Startplatz fliegen
+let energy = 1;
 let shotsLeft = BURST;
 let shotTimer = 0;
 let shake = 0;
 let elapsed = 0;
+let lastMoveAt = 0;            // Sekunden (Echtzeit), letzte echte Mausbewegung
 let hovering = false;
 
+const now = () => performance.now() / 1000;
 const rand = (a, b) => a + Math.random() * (b - a);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
-// Ausrichtung der Nase für eine Bildschirmrichtung (Nase = lokales +y, Bildschirm-y zeigt nach unten)
-const headingTo = (dx, dy) => Math.atan2(-dx, -dy);
-const noseX = () => ship.x - Math.sin(ship.angle) * 0.72 * PX;
-const noseY = () => ship.y - Math.cos(ship.angle) * 0.72 * PX;
+// Kurswinkel für eine Bildschirmrichtung (Bug = lokales +x, Bildschirm-y zeigt nach unten)
+const headingTo = (dx, dy) => Math.atan2(-dy, dx);
+const noseX = () => ship.x + Math.cos(ship.angle) * NOSE * PX;
+const noseY = () => ship.y - Math.sin(ship.angle) * NOSE * PX;
+const flying = () => ['launch', 'hunt', 'hit', 'return'].includes(state);
 
 function setState(next) {
     state = next;
     stateTime = 0;
-    if (next === 'charging') launchAt = Infinity;
 }
 
-function launch() {
-    if (state !== 'charging') return;
-    setState('launch');
-    ship.vx = 0; ship.vy = 0;
+function hide() {
+    setState('hidden');
+    fx.clearEffects(scene);
+    win.x = NaN; win.y = NaN;
+    hovering = false;
+    host.hide(area.x + area.width - 1, area.y + area.height - 1);
+    lastMoveAt = now();            // erst nach erneutem Stillstand wieder ausrücken
+}
+
+async function deploy() {
+    if (state !== 'hidden') return;
+    setState('deploying');
+    await refreshArea(cursor.x, cursor.y);
+    // Lift seitlich neben dem Mauszeiger, damit man das Schiff hochfahren sieht
+    const side = cursor.x > area.x + area.width / 2 ? -1 : 1;
+    lift.x = THREE.MathUtils.clamp(cursor.x + side * 260, area.x + 170, area.x + area.width - 170);
+    lift.y = hiddenY();
+    Object.assign(ship, { x: lift.x, y: onLiftY(), vx: 0, vy: 0, angle: 0, spin: 0, present: 0, bank: 0 });
+    win.offset = LIFT_VIEW_OFFSET;
+    setState('liftUp');
 }
 
 function hit() {
@@ -146,7 +175,9 @@ function steer(tx, ty, maxSpeed, dt, gain = 2.5) {
 
 function turnTowards(target, dt) {
     const diff = wrapAngle(target - ship.angle);
-    ship.angle += THREE.MathUtils.clamp(diff, -TURN_RATE * dt, TURN_RATE * dt);
+    const step = THREE.MathUtils.clamp(diff, -TURN_RATE * dt, TURN_RATE * dt);
+    ship.angle += step;
+    ship.bank = THREE.MathUtils.lerp(ship.bank, -step / Math.max(dt, 1e-3) * 0.12, 1 - Math.exp(-dt * 6));
     return Math.abs(diff);
 }
 
@@ -159,17 +190,24 @@ function clampToScreens() {
     ship.y = THREE.MathUtils.clamp(ship.y, top, bottom);
 }
 
-async function refreshArea() {
+async function refreshArea(x = lift.x, y = groundY() - 10) {
     allAreas = await host.displays();
-    area = await host.workArea(home.x, area.y + area.height - 10);
+    area = await host.workArea(x, y);
+    display = await host.displayBounds(x, y);
 }
 
 // ---------------------------------------------------------------------------
-// Maus: Hover-Test (Klick-Durchlass), Klick = Treffer
+// Maus: Stillstand erkennen, Hover-Test (Klick-Durchlass), Klick = Treffer
 // ---------------------------------------------------------------------------
+const lastCursor = { x: NaN, y: NaN };
 host.onCursor((p) => {
     cursor.x = p.x; cursor.y = p.y;
-    const over = Math.hypot(p.x - ship.x, p.y - ship.y) < 0.5 * PX;
+    if (!(Math.abs(p.x - lastCursor.x) <= IDLE_TOLERANCE && Math.abs(p.y - lastCursor.y) <= IDLE_TOLERANCE)) {
+        lastCursor.x = p.x; lastCursor.y = p.y;
+        lastMoveAt = now();
+    }
+    if (state === 'hidden' || state === 'deploying') return;
+    const over = Math.hypot(p.x - ship.x, p.y - ship.y) < 0.75 * PX;
     if (over !== hovering) {
         hovering = over;
         host.ignoreMouse(!over);
@@ -178,24 +216,15 @@ host.onCursor((p) => {
 
 renderer.domElement.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;
-    if (state === 'hunt' || state === 'launch' || state === 'return') hit();
-    else if (state === 'charging' && energy >= 1) launch();
-    else shake = 0.4;                         // beim Laden nicht stören!
+    if (flying() && state !== 'hit') hit();
+    else shake = 0.4;                          // auf dem Lift: nur Wackeln
 });
 renderer.domElement.addEventListener('contextmenu', (e) => { e.preventDefault(); host.contextMenu(); });
 
 host.onCommand((cmd) => {
-    if (cmd === 'launch') launch();
+    if (cmd === 'launch') deploy();
     if (cmd === 'land' && (state === 'hunt' || state === 'launch')) setState('return');
     if (cmd === 'displays') refreshArea();
-    if (cmd === 'home') {
-        host.workArea(cursor.x, cursor.y).then((a) => {
-            area = a;
-            home.x = THREE.MathUtils.clamp(cursor.x, a.x + SIZE / 2, a.x + a.width - SIZE / 2);
-            if (state === 'charging') { relocate = true; launch(); }
-            else if (state !== 'landing') setState('return');
-        });
-    }
 });
 
 // ---------------------------------------------------------------------------
@@ -205,37 +234,55 @@ function update(dt) {
     elapsed += dt;
     stateTime += dt;
     let thrust = 0;
+    let present = 1;              // 0 = Seitenansicht (auf dem Lift), 1 = Draufsicht (im Flug)
     let flicker = energy < 0.25 ? 0.6 : 0;
+    let offset = 0;
+    let liftTarget = hiddenY();   // wo der Lift hinfahren soll
+    let liftFollow = false;       // Schiff steht auf dem Lift und fährt mit
 
     switch (state) {
-        case 'charging': {
-            energy = Math.min(1, energy + dt / CHARGE_TIME);
-            if (energy >= 1 && launchAt === Infinity) launchAt = elapsed + rand(...LAUNCH_DELAY);
-            if (elapsed >= launchAt) launch();
-            ship.x = home.x; ship.y = landedY();
-            ship.vx = 0; ship.vy = 0;
-            turnTowards(0, dt);
-            flicker = 0;
+        case 'hidden':
+        case 'deploying': return;    // Hangar läuft über den Timer unten
+        case 'liftUp': {
+            // von unten über die Taskleiste herauffahren
+            liftTarget = liftTopY();
+            liftFollow = true;
+            present = 0; offset = LIFT_VIEW_OFFSET; flicker = 0;
+            if (Math.abs(lift.y - liftTopY()) < 0.5) setState('ready');
+            break;
+        }
+        case 'ready': {
+            // Triebwerke warmlaufen lassen
+            liftTarget = liftTopY();
+            liftFollow = true;
+            present = 0; offset = LIFT_VIEW_OFFSET;
+            thrust = Math.min(0.45, stateTime * 0.4) * (0.8 + Math.random() * 0.2);
+            if (stateTime > 1.5) {
+                setState('launch');
+                for (let i = 0; i < 10; i++) {
+                    const s = i % 2 ? 1 : -1;
+                    fx.spawn('smoke', lift.x + s * rand(20, 60), lift.y - 4, s * rand(60, 170), rand(-25, 0), rand(0.35, 0.6), rand(0.8, 1.3));
+                }
+            }
             break;
         }
         case 'launch': {
-            // senkrecht hoch, Rauch am Startplatz
+            // senkrecht hoch, dabei vom Seitenprofil in die Draufsicht kippen
+            liftTarget = stateTime > 0.6 ? hiddenY() : liftTopY();
             thrust = 1;
-            ship.vy = Math.max(ship.vy - 700 * dt, -520);
-            ship.x = THREE.MathUtils.lerp(ship.x, home.x, 0.2);
-            turnTowards(0, dt);
-            if (stateTime < 0.8 && Math.random() < dt * 30) {
-                const s = Math.sign(Math.random() - 0.5);
-                fx.spawn('smoke', home.x + s * rand(10, 40), groundY() - 6, s * rand(60, 160), rand(-20, 0), rand(0.35, 0.6), rand(0.8, 1.3));
-            }
-            if (ship.y < landedY() - 200) setState(relocate ? 'return' : 'hunt');
+            ship.vy = Math.max(ship.vy - 600 * dt, -420);
+            ship.vx = 0;
+            present = THREE.MathUtils.clamp((stateTime - 0.2) / 0.8, 0, 1);
+            offset = LIFT_VIEW_OFFSET * (1 - present);
+            if (present > 0.5) turnTowards(Math.PI / 2, dt);
+            if (stateTime > 1.3) setState(energy < RETURN_AT ? 'return' : 'hunt');
             break;
         }
         case 'hunt': {
             // umkreist den Mauszeiger, bevorzugt von oben, und feuert Salven
             const a = -Math.PI / 2 + Math.sin(elapsed * 0.6) * 1.2;
             const accel = steer(cursor.x + Math.cos(a) * ORBIT_RADIUS, cursor.y + Math.sin(a) * ORBIT_RADIUS, MAX_SPEED, dt);
-            thrust = THREE.MathUtils.clamp(0.45 + accel / 1500, 0.45, 1);
+            thrust = THREE.MathUtils.clamp(0.4 + accel / 1500, 0.4, 1);
 
             const dist = Math.hypot(cursor.x - ship.x, cursor.y - ship.y);
             const speed = Math.hypot(ship.vx, ship.vy);
@@ -246,8 +293,7 @@ function update(dt) {
 
             shotTimer -= dt;
             if (dist < FIRE_RANGE && off < 0.25 && shotTimer <= 0) {
-                const tx = cursor.x, ty = cursor.y;
-                fx.fireLaser(noseX(), noseY(), tx, ty, LASER_SPEED, (x, y) => fx.burst(x, y));
+                fx.fireLaser(noseX(), noseY(), cursor.x, cursor.y, LASER_SPEED, (x, y) => fx.burst(x, y));
                 energy -= SHOT_COST;
                 shotsLeft--;
                 shotTimer = shotsLeft > 0 ? BURST_GAP : BURST_PAUSE;
@@ -269,70 +315,114 @@ function update(dt) {
             break;
         }
         case 'return': {
-            // langsamer zurück über den Startplatz
-            const tx = home.x, ty = landedY() - 150;
+            // zurück über die Lift-Stelle; kurz davor ins Seitenprofil kippen
+            const tx = lift.x, ty = liftTopY() - 130;
             const accel = steer(tx, ty, MAX_SPEED * 0.6, dt, 1.8);
             thrust = THREE.MathUtils.clamp(0.4 + accel / 1500, 0.4, 0.8);
+            const dist = Math.hypot(tx - ship.x, ty - ship.y);
             const speed = Math.hypot(ship.vx, ship.vy);
-            turnTowards(speed > 60 ? headingTo(ship.vx, ship.vy) : 0, dt);
+            const near = THREE.MathUtils.clamp(1 - (dist - 40) / 220, 0, 1);
+            present = 1 - near;
+            offset = LIFT_VIEW_OFFSET * near;
+            turnTowards(near > 0.3 || speed < 60 ? 0 : headingTo(ship.vx, ship.vy), dt);
             energy = Math.max(0.02, energy - FLIGHT_DRAIN * 0.3 * dt);
-            if (Math.hypot(tx - ship.x, ty - ship.y) < 15 && speed < 80) { relocate = false; setState('landing'); }
+            if (dist < 12 && speed < 60) setState('liftCall');
+            break;
+        }
+        case 'liftCall': {
+            // schwebt, bis der Lift wieder oben ist
+            ship.vx = 0; ship.vy = 0;
+            ship.y = liftTopY() - 130 + Math.sin(elapsed * 3) * 3;
+            ship.x = THREE.MathUtils.lerp(ship.x, lift.x, 1 - Math.exp(-dt * 4));
+            turnTowards(0, dt);
+            liftTarget = liftTopY();
+            present = 0; offset = LIFT_VIEW_OFFSET; thrust = 0.4;
+            if (Math.abs(lift.y - liftTopY()) < 0.5) setState('landing');
             break;
         }
         case 'landing': {
-            // aufrichten und sanft absetzen
+            // sanft auf die Plattform absetzen
             turnTowards(0, dt);
+            liftTarget = liftTopY();
+            present = 0; offset = LIFT_VIEW_OFFSET; thrust = 0.35;
             ship.vx = 0;
-            ship.x = THREE.MathUtils.lerp(ship.x, home.x, 1 - Math.exp(-dt * 5));
-            ship.vy = THREE.MathUtils.clamp((landedY() - ship.y) * 2.2, 25, 220);
-            thrust = 0.35;
-            if (landedY() - ship.y < 1) {
-                ship.y = landedY();
+            ship.x = THREE.MathUtils.lerp(ship.x, lift.x, 1 - Math.exp(-dt * 5));
+            ship.vy = THREE.MathUtils.clamp((onLiftY() - ship.y) * 2.2, 20, 200);
+            if (onLiftY() - ship.y < 1) {
+                ship.y = onLiftY();
                 ship.vy = 0;
                 shake = 0.25;
                 for (let i = 0; i < 8; i++) {
                     const s = i % 2 ? 1 : -1;
-                    fx.spawn('smoke', home.x + s * rand(10, 30), groundY() - 6, s * rand(40, 120), rand(-15, 0), rand(0.3, 0.5), rand(0.7, 1.1));
+                    fx.spawn('smoke', lift.x + s * rand(20, 50), lift.y - 4, s * rand(40, 120), rand(-15, 0), rand(0.3, 0.5), rand(0.7, 1.1));
                 }
-                setState('charging');
+                setState('liftDown');
             }
+            break;
+        }
+        case 'liftDown': {
+            // kurz durchatmen, dann mit dem Lift nach unten in den Hangar
+            liftTarget = stateTime > 0.8 ? hiddenY() : liftTopY();
+            liftFollow = true;
+            present = 0; offset = LIFT_VIEW_OFFSET;
+            if (lift.y >= hiddenY() - 0.5) { hide(); return; }
             break;
         }
     }
 
-    if (state !== 'charging') {
+    // Lift fahren (sanft anfahren und abbremsen)
+    const liftDelta = liftTarget - lift.y;
+    lift.y += Math.sign(liftDelta) * Math.min(Math.abs(liftDelta), Math.min(LIFT_SPEED, 25 + Math.abs(liftDelta) * 1.5) * dt);
+
+    if (liftFollow) {
+        ship.x = lift.x; ship.y = onLiftY();
+        ship.vx = 0; ship.vy = 0;
+        turnTowards(0, dt);
+    } else if (state !== 'liftCall') {
         ship.x += ship.vx * dt;
         ship.y += ship.vy * dt;
         if (state === 'hunt' || state === 'hit' || state === 'return') clampToScreens();
     }
+    if (!flying()) ship.bank *= Math.exp(-dt * 6);
 
     // Fenster mitbewegen (ganze Pixel), Szene relativ zur echten Fenstermitte zeichnen
-    const wx = Math.round(ship.x - SIZE / 2), wy = Math.round(ship.y - SIZE / 2);
+    win.offset = THREE.MathUtils.lerp(win.offset, offset, 1 - Math.exp(-dt * 6));
+    const wx = Math.round(ship.x - SIZE / 2), wy = Math.round(ship.y + win.offset - SIZE / 2);
     if (wx !== win.x || wy !== win.y) { win.x = wx; win.y = wy; host.move(wx, wy); }
     const cx = win.x + SIZE / 2, cy = win.y + SIZE / 2;
     const toWorld = (sx, sy) => ({ x: (sx - cx) / PX, y: -(sy - cy) / PX });
 
     shake = Math.max(0, shake - dt);
     const s = toWorld(ship.x, ship.y);
-    rocket.ship.position.set(s.x + Math.sin(elapsed * 60) * shake * 0.08, s.y, 0);
-    rocket.ship.rotation.z = ship.angle;
-    // leichtes Rollen um die Längsachse zeigt die Flossen von verschiedenen Seiten
-    const rollTarget = state === 'charging' ? 0 : Math.sin(elapsed * 1.7) * 0.7;
-    rocket.hull.rotation.y = THREE.MathUtils.lerp(rocket.hull.rotation.y, rollTarget, 1 - Math.exp(-dt * 3));
+    freighter.ship.position.set(s.x + Math.sin(elapsed * 60) * shake * 0.08, s.y, 0);
+    freighter.ship.rotation.z = ship.angle;
+    ship.present = THREE.MathUtils.lerp(ship.present, present, 1 - Math.exp(-dt * 8));
+    freighter.hull.rotation.x = ship.present * Math.PI / 2 + THREE.MathUtils.clamp(ship.bank, -0.5, 0.5);
+    freighter.update(dt);
 
-    const p = toWorld(home.x, groundY());
-    pad.position.set(p.x, p.y, -0.5);
-    pad.visible = Math.abs(p.x) < half + 1 && Math.abs(p.y) < half + 1;
+    const l = toWorld(lift.x, lift.y);
+    liftMesh.position.set(l.x, l.y, -1);
+    liftMesh.visible = Math.abs(l.x) < half + 1.5 && l.y < half + 0.5;
 
     U.energy.value = Math.max(energy, 0);
-    U.charging.value = state === 'charging' && energy < 1 ? 1 : 0;
     U.flicker.value = flicker;
-    U.padCharge.value = state === 'charging' ? energy : 0;
-    U.padLights.value = state === 'charging' ? (Math.sin(elapsed * (energy >= 1 ? 6 : 2)) > 0 ? 1 : 0.15) : 0.15;
-    rocket.setThrust(THREE.MathUtils.lerp(U.thrust.value, thrust, 1 - Math.exp(-dt * 12)));
+    U.padCharge.value = energy;
+    U.beacon.value = ['liftUp', 'ready', 'liftCall', 'liftDown'].includes(state) ? (Math.sin(elapsed * 9) > 0 ? 1 : 0) : 0;
+    freighter.setThrust(THREE.MathUtils.lerp(U.thrust.value, thrust, 1 - Math.exp(-dt * 12)));
 
     fx.updateEffects(dt, scene, toWorld);
 }
+
+// Hangar: Laden und Stillstand prüfen über einen eigenen Timer, denn ein 1-Pixel-Fenster kann vom
+// Betriebssystem als verdeckt gelten und bekommt dann womöglich keine Animationsbilder mehr.
+let hangarTick = now();
+setInterval(() => {
+    const t = now(), dt = t - hangarTick;
+    hangarTick = t;
+    if (state !== 'hidden') return;
+    energy = Math.min(1, energy + dt / CHARGE_TIME);
+    if (energy >= 1 && t - lastMoveAt >= IDLE_TRIGGER) deploy();
+}, 500);
 
 const timer = new THREE.Timer();
 timer.connect(document);
@@ -340,12 +430,13 @@ timer.connect(document);
 renderer.setAnimationLoop((t) => {
     timer.update(t);
     update(Math.min(timer.getDelta(), 1 / 20));
-    renderer.render(scene, camera);
+    // im Hangar (1-Pixel-Fenster) nichts zeichnen
+    if (state !== 'hidden' && state !== 'deploying') renderer.render(scene, camera);
 });
 
 // zum Ausprobieren in den Entwicklertools
 window.raumschiff = {
-    launch, hit, uniforms: U,
+    deploy, hit, uniforms: U,
     get state() { return state; },
     set energy(v) { energy = v; },
     get energy() { return energy; }
