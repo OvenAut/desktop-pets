@@ -1,15 +1,15 @@
-// Verhalten des Raumschiffs: wartet unsichtbar im Hangar (Fenster 1 × 1 Pixel) und lädt. Steht der
+// Verhalten des TIE-Fighters: wartet unsichtbar im Hangar (Fenster 1 × 1 Pixel) und lädt. Steht der
 // Mauszeiger lange still, fährt es auf einem Lift von unten herauf, startet, jagt und beschießt den
 // Mauszeiger, fliegt bei leerem Akku zurück, landet auf dem Lift und fährt wieder hinunter.
 import * as THREE from 'three/webgpu';
-import { createScene, shipUniforms as U, SHIP_BOTTOM, NOSE } from './ship.js';
+import { createScene, shipUniforms as U, SHIP_BOTTOM } from './ship.js';
 
 const params = new URLSearchParams(location.search);
 
 // ---------------------------------------------------------------------------
 // Einstellungen
 // ---------------------------------------------------------------------------
-const VIEW_WIDTH = 5;             // sichtbare Breite in Welteinheiten (Schiff ≈ 2 lang)
+const VIEW_WIDTH = 5;             // sichtbare Breite in Welteinheiten (TIE-Flügel ≈ 1,8 hoch)
 const IDLE_TRIGGER = Number(params.get('idle')) || 5 * 60;   // so lange muss der Mauszeiger stillstehen (s)
 const IDLE_TOLERANCE = 3;         // kleinere Bewegungen (Pixel) zählen nicht als Bewegung
 const CHARGE_TIME = 15;           // Sekunden von leer bis voll (lädt im Hangar)
@@ -89,9 +89,9 @@ const half = VIEW_WIDTH / 2;
 const camera = new THREE.OrthographicCamera(-half, half, half, -half, 0.1, 50);
 camera.position.set(0, 0, 10);
 
-const fx = createScene();
-const { freighter, lift: liftMesh } = fx;
-scene.add(freighter.ship, liftMesh);
+const fx = await createScene();
+const { tie, lift: liftMesh } = fx;
+scene.add(tie.ship, liftMesh);
 
 // ---------------------------------------------------------------------------
 // Zustand (alles in Bildschirmpixeln)
@@ -124,8 +124,7 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 // Kurswinkel für eine Bildschirmrichtung (Bug = lokales +x, Bildschirm-y zeigt nach unten)
 const headingTo = (dx, dy) => Math.atan2(-dy, dx);
-const noseX = () => ship.x + Math.cos(ship.angle) * NOSE * PX;
-const noseY = () => ship.y - Math.sin(ship.angle) * NOSE * PX;
+const UP = Math.PI / 2;           // auf dem Lift und beim Start zeigt der Bug nach oben
 const flying = () => ['launch', 'hunt', 'hit', 'return'].includes(state);
 
 function setState(next) {
@@ -150,7 +149,7 @@ async function deploy() {
     const side = cursor.x > area.x + area.width / 2 ? -1 : 1;
     lift.x = THREE.MathUtils.clamp(cursor.x + side * 260, area.x + 170, area.x + area.width - 170);
     lift.y = hiddenY();
-    Object.assign(ship, { x: lift.x, y: onLiftY(), vx: 0, vy: 0, angle: 0, spin: 0, present: 0, bank: 0 });
+    Object.assign(ship, { x: lift.x, y: onLiftY(), vx: 0, vy: 0, angle: UP, spin: 0, present: 0, bank: 0 });
     win.offset = LIFT_VIEW_OFFSET;
     setState('liftUp');
 }
@@ -207,7 +206,7 @@ host.onCursor((p) => {
         lastMoveAt = now();
     }
     if (state === 'hidden' || state === 'deploying') return;
-    const over = Math.hypot(p.x - ship.x, p.y - ship.y) < 0.75 * PX;
+    const over = Math.hypot(p.x - ship.x, p.y - ship.y) < 0.9 * PX;
     if (over !== hovering) {
         hovering = over;
         host.ignoreMouse(!over);
@@ -234,7 +233,7 @@ function update(dt) {
     elapsed += dt;
     stateTime += dt;
     let thrust = 0;
-    let present = 1;              // 0 = Seitenansicht (auf dem Lift), 1 = Draufsicht (im Flug)
+    let present = 1;              // 0 = Frontansicht (auf dem Lift), 1 = Flugansicht
     let flicker = energy < 0.25 ? 0.6 : 0;
     let offset = 0;
     let liftTarget = hiddenY();   // wo der Lift hinfahren soll
@@ -267,14 +266,14 @@ function update(dt) {
             break;
         }
         case 'launch': {
-            // senkrecht hoch, dabei vom Seitenprofil in die Draufsicht kippen
+            // senkrecht hoch, dabei aus der Frontansicht nach oben kippen
             liftTarget = stateTime > 0.6 ? hiddenY() : liftTopY();
             thrust = 1;
             ship.vy = Math.max(ship.vy - 600 * dt, -420);
             ship.vx = 0;
             present = THREE.MathUtils.clamp((stateTime - 0.2) / 0.8, 0, 1);
             offset = LIFT_VIEW_OFFSET * (1 - present);
-            if (present > 0.5) turnTowards(Math.PI / 2, dt);
+            turnTowards(UP, dt);
             if (stateTime > 1.3) setState(energy < RETURN_AT ? 'return' : 'hunt');
             break;
         }
@@ -293,7 +292,13 @@ function update(dt) {
 
             shotTimer -= dt;
             if (dist < FIRE_RANGE && off < 0.25 && shotTimer <= 0) {
-                fx.fireLaser(noseX(), noseY(), cursor.x, cursor.y, LASER_SPEED, (x, y) => fx.burst(x, y));
+                // Doppelschuss aus beiden Kanonen, leicht versetzt
+                const c = tie.cannon();
+                const mx = ship.x + c.x * PX, my = ship.y - c.y * PX;
+                const len = Math.max(1, Math.hypot(cursor.x - mx, cursor.y - my));
+                const px = -(cursor.y - my) / len * 5, py = (cursor.x - mx) / len * 5;
+                fx.fireLaser(mx + px, my + py, cursor.x + px, cursor.y + py, LASER_SPEED, (x, y) => fx.burst(x, y));
+                fx.fireLaser(mx - px, my - py, cursor.x - px, cursor.y - py, LASER_SPEED);
                 energy -= SHOT_COST;
                 shotsLeft--;
                 shotTimer = shotsLeft > 0 ? BURST_GAP : BURST_PAUSE;
@@ -315,16 +320,16 @@ function update(dt) {
             break;
         }
         case 'return': {
-            // zurück über die Lift-Stelle; kurz davor ins Seitenprofil kippen
+            // zurück über die Lift-Stelle; kurz davor Bug nach oben und in die Frontansicht kippen
             const tx = lift.x, ty = liftTopY() - 130;
             const accel = steer(tx, ty, MAX_SPEED * 0.6, dt, 1.8);
             thrust = THREE.MathUtils.clamp(0.4 + accel / 1500, 0.4, 0.8);
             const dist = Math.hypot(tx - ship.x, ty - ship.y);
             const speed = Math.hypot(ship.vx, ship.vy);
             const near = THREE.MathUtils.clamp(1 - (dist - 40) / 220, 0, 1);
-            present = 1 - near;
+            turnTowards(near > 0.3 || speed < 60 ? UP : headingTo(ship.vx, ship.vy), dt);
+            present = Math.abs(wrapAngle(ship.angle - UP)) < 0.2 ? 1 - near : 1;
             offset = LIFT_VIEW_OFFSET * near;
-            turnTowards(near > 0.3 || speed < 60 ? 0 : headingTo(ship.vx, ship.vy), dt);
             energy = Math.max(0.02, energy - FLIGHT_DRAIN * 0.3 * dt);
             if (dist < 12 && speed < 60) setState('liftCall');
             break;
@@ -334,7 +339,7 @@ function update(dt) {
             ship.vx = 0; ship.vy = 0;
             ship.y = liftTopY() - 130 + Math.sin(elapsed * 3) * 3;
             ship.x = THREE.MathUtils.lerp(ship.x, lift.x, 1 - Math.exp(-dt * 4));
-            turnTowards(0, dt);
+            turnTowards(UP, dt);
             liftTarget = liftTopY();
             present = 0; offset = LIFT_VIEW_OFFSET; thrust = 0.4;
             if (Math.abs(lift.y - liftTopY()) < 0.5) setState('landing');
@@ -342,7 +347,7 @@ function update(dt) {
         }
         case 'landing': {
             // sanft auf die Plattform absetzen
-            turnTowards(0, dt);
+            turnTowards(UP, dt);
             liftTarget = liftTopY();
             present = 0; offset = LIFT_VIEW_OFFSET; thrust = 0.35;
             ship.vx = 0;
@@ -377,7 +382,7 @@ function update(dt) {
     if (liftFollow) {
         ship.x = lift.x; ship.y = onLiftY();
         ship.vx = 0; ship.vy = 0;
-        turnTowards(0, dt);
+        turnTowards(UP, dt);
     } else if (state !== 'liftCall') {
         ship.x += ship.vx * dt;
         ship.y += ship.vy * dt;
@@ -394,11 +399,11 @@ function update(dt) {
 
     shake = Math.max(0, shake - dt);
     const s = toWorld(ship.x, ship.y);
-    freighter.ship.position.set(s.x + Math.sin(elapsed * 60) * shake * 0.08, s.y, 0);
-    freighter.ship.rotation.z = ship.angle;
+    tie.ship.position.set(s.x + Math.sin(elapsed * 60) * shake * 0.08, s.y, 0);
     ship.present = THREE.MathUtils.lerp(ship.present, present, 1 - Math.exp(-dt * 8));
-    freighter.hull.rotation.x = ship.present * Math.PI / 2 + THREE.MathUtils.clamp(ship.bank, -0.5, 0.5);
-    freighter.update(dt);
+    // Sprite-Bild: Flugrichtung, Schräglage in Kurven, Start-/Landesequenz
+    const bank = ship.bank < -0.15 ? -1 : ship.bank > 0.15 ? 1 : 0;
+    tie.pose(ship.angle, bank, ship.present);
 
     const l = toWorld(lift.x, lift.y);
     liftMesh.position.set(l.x, l.y, -1);
@@ -408,7 +413,7 @@ function update(dt) {
     U.flicker.value = flicker;
     U.padCharge.value = energy;
     U.beacon.value = ['liftUp', 'ready', 'liftCall', 'liftDown'].includes(state) ? (Math.sin(elapsed * 9) > 0 ? 1 : 0) : 0;
-    freighter.setThrust(THREE.MathUtils.lerp(U.thrust.value, thrust, 1 - Math.exp(-dt * 12)));
+    U.thrust.value = THREE.MathUtils.lerp(U.thrust.value, thrust, 1 - Math.exp(-dt * 12));
 
     fx.updateEffects(dt, scene, toWorld);
 }

@@ -1,34 +1,30 @@
-// Aussehen: flacher Untertassen-Frachter mit Gabelbug, Triebwerksbogen, Lift mit Plattform, Laser und
-// Partikel – alle Materialien als TSL-Shader.
-// Das Schiff liegt in der lokalen xz-Ebene (Oberseite = +y, Bug = +x). Auf dem Lift sieht man es von der
-// Seite (flach), im Flug wird es um die Längsachse gekippt und von oben gezeigt.
+// Aussehen: TIE-Fighter als vorgerendertes Sprite (Atlas aus tools/render-sprites.mjs), Lift mit Plattform,
+// Laser und Partikel – alle Materialien als TSL-Shader.
 import * as THREE from 'three/webgpu';
 import {
-    Fn, uniform, float, vec2, vec3, mix, smoothstep, step, abs, max, length, normalize, dot, sin, atan,
+    Fn, uniform, float, vec2, vec3, mix, smoothstep, step, abs, max, length, normalize, dot, sin,
     color, oneMinus, positionGeometry, normalView, positionViewDirection, time, mx_noise_float, uv,
-    floor, fract, pow, hash
+    floor, fract, texture
 } from 'three/tsl';
 
-export const SHIP_BOTTOM = 0.16;  // Abstand Mitte → Unterseite der Landestützen (Seitenansicht)
-export const NOSE = 1.15;         // Abstand Mitte → Spitze des Gabelbugs (dort kommen die Laser raus)
+import tieMeta from '../assets/tie.js';
+
+export const SPRITE_SIZE = 2.3;   // Kantenlänge eines Sprite-Bildes in Welteinheiten
+// Abstand Mitte → unterste Flügelspitze in der Frontansicht: darauf steht der TIE auf dem Lift
+export const SHIP_BOTTOM = -tieMeta.standY * SPRITE_SIZE / 2;
 export const PAD_HEIGHT = 0.16;
 
 export const shipUniforms = {
-    energy: uniform(1),           // 0 … 1 Akkustand
-    thrust: uniform(0),           // 0 = aus, 1 = voller Schub
+    energy: uniform(1),           // 0 … 1 Akkustand (wenig: rotes Warnpulsen)
+    thrust: uniform(0),           // 0 = aus, 1 = voller Schub (Ionen-Glühen)
     flicker: uniform(0),          // Störung (wenig Energie, getroffen)
     padCharge: uniform(1),
     beacon: uniform(0)            // Warnlicht am Lift (0 … 1)
 };
 
-const cHull = color('#d9dbd6');
-const cPanel = color('#a9aea8');
 const cDark = color('#3a3f4b');
-const cAccent = color('#c4473a');
-const cEngine = color('#5fd2ff');
-const cCyan = color('#3fe0ff');
 const cWarn = color('#ff3b30');
-const cLaser = color('#ff2d6f');
+const cLaser = color('#3dff5a');                // TIE-Laser sind grün
 const cHazard = color('#ffc21a');
 
 // Comic-Licht: zwei Helligkeitsstufen + Randlicht + harter Glanz
@@ -47,151 +43,72 @@ function solidMaterial(c) {
 }
 
 // Rumpf: Blechplatten in Sektoren und Ringen, jede Platte leicht anders getönt, rote Zierstreifen
-function hullMaterial() {
-    const m = new THREE.MeshBasicNodeMaterial();
-    m.colorNode = Fn(() => {
-        const p = positionGeometry;
-        const r = length(p.xz);
-        const a = atan(p.z, p.x).div(Math.PI * 2).add(0.5);          // 0 … 1 rundherum
-        const sectors = float(14);
-        const ring = floor(r.mul(4.5));
-        const sector = floor(a.mul(sectors));
-        const tone = hash(sector.add(ring.mul(31))).mul(0.18);
-        const base = mix(cHull, cPanel, tone.mul(4).clamp(0, 1).mul(0.5)).toVar();
-        // Fugen zwischen den Platten
-        const seamA = smoothstep(0.035, 0.0, abs(fract(a.mul(sectors)).sub(0.5)).sub(0.5).abs()).mul(step(0.3, r));
-        const seamR = smoothstep(0.02, 0.0, abs(fract(r.mul(4.5)).sub(0.5)).sub(0.5).abs());
-        base.assign(mix(base, cDark, max(seamA, seamR).mul(0.45)));
-        // zwei rote Streifen auf der Oberseite, schräg nach vorn
-        const stripe = step(0.45, r).mul(step(r, 0.75)).mul(step(0.0, p.y)).mul(
-            max(step(abs(a.sub(0.62)), 0.012), step(abs(a.sub(0.38)), 0.012)));
-        base.assign(mix(base, cAccent, stripe));
-        return toon(base);
-    })();
-    return m;
-}
 
-// Cockpitglas: Farbe zeigt den Akku (cyan = voll, rot = leer), flackert bei Störung
-function glassMaterial() {
+// TIE-Fighter als Sprite: ein Quad, dessen Bildausschnitt aus dem vorgerenderten Atlas
+// (tools/render-sprites.mjs) gewählt wird. Flackern und Warnpulsen kommen per TSL dazu.
+function createTieSprite(atlas, meta) {
     const u = shipUniforms;
-    const m = new THREE.MeshBasicNodeMaterial();
-    m.colorNode = Fn(() => {
-        const glow = mix(cWarn, cCyan, smoothstep(0.1, 0.6, u.energy));
-        const noise = mx_noise_float(vec2(time.mul(25), 0)).mul(0.5).add(0.5);
-        const flick = mix(float(1), step(0.45, noise), u.flicker);
-        const fres = oneMinus(max(dot(normalView, positionViewDirection), 0)).pow(2);
-        return glow.mul(flick.mul(0.7)).add(fres.mul(0.4));
-    })();
-    return m;
-}
+    const frameOffset = uniform(new THREE.Vector2());
+    const cell = vec2(1 / meta.cols, 1 / meta.rows);
+    const material = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false });
+    const sample = texture(atlas, uv().mul(cell).add(frameOffset));
+    const noise = mx_noise_float(vec2(time.mul(25), 0)).mul(0.5).add(0.5);
+    const flick = mix(float(1), step(0.4, noise).mul(0.5).add(0.5), u.flicker);
+    const warn = oneMinus(smoothstep(0.1, 0.3, u.energy)).mul(sin(time.mul(10)).mul(0.5).add(0.5));
+    material.colorNode = mix(sample.rgb, sample.rgb.mul(vec3(1.6, 0.5, 0.4)), warn.mul(0.6)).mul(flick);
+    material.opacityNode = sample.a;
 
-// Triebwerksbogen am Heck: glimmt im Leerlauf, strahlt bei Schub
-function engineMaterial() {
-    const u = shipUniforms;
-    const m = new THREE.MeshBasicNodeMaterial();
-    const shimmer = mx_noise_float(vec2(uv().x.mul(30), time.mul(8))).mul(0.15);
-    m.colorNode = mix(cDark, mix(cEngine, vec3(0.9, 1, 1), u.thrust.mul(0.6)), u.thrust.mul(0.8).add(0.2).add(shimmer));
-    return m;
-}
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(SPRITE_SIZE, SPRITE_SIZE), material);
+    const ship = new THREE.Group();
+    ship.add(mesh);
 
-// Abgasschleier hinter dem Heck: Verlauf + Rauschen, Länge = Schub
-function plumeMaterial() {
-    const u = shipUniforms;
-    const m = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide });
-    const t = oneMinus(uv().x);                        // 0 am Heck … 1 am Ende
-    const across = abs(uv().y.sub(0.5)).mul(2);
-    const n = mx_noise_float(vec2(uv().y.mul(8), t.mul(4).sub(time.mul(10)))).mul(0.5).add(0.5);
-    m.colorNode = mix(vec3(0.9, 1, 1), cEngine, smoothstep(0.0, 0.5, t.add(across.mul(0.3))));
-    m.opacityNode = pow(oneMinus(t), 1.5).mul(smoothstep(1.0, 0.4, across)).mul(n.mul(0.5).add(0.5))
-        .mul(smoothstep(0.0, 0.2, u.thrust)).clamp(0, 1);
-    return m;
-}
+    // Ionen-Glühen hinter der Kugel, Stärke = Schub
+    const glowMaterial = new THREE.SpriteNodeMaterial({ transparent: true, depthWrite: false });
+    const d = length(uv().sub(0.5)).mul(2);
+    glowMaterial.colorNode = mix(vec3(1, 0.9, 0.7), color('#ff6a2a'), smoothstep(0.0, 0.7, d));
+    glowMaterial.opacityNode = smoothstep(1.0, 0.0, d).pow(2).mul(u.thrust).mul(0.9);
+    const glow = new THREE.Sprite(glowMaterial);
+    glow.scale.setScalar(0.45);
+    glow.position.z = -0.1;
+    ship.add(glow);
 
-function createFreighter() {
-    const u = shipUniforms;
-    const ship = new THREE.Group();   // Position + Kurs in der Bildebene (rotation.z)
-    const hull = new THREE.Group();   // Kippen zwischen Seiten- und Draufsicht, Schräglage
-    ship.add(hull);
-
-    // flache Untertasse mit leicht gewölbter Oberseite
-    const profile = [
-        [0, -0.11], [0.62, -0.1], [0.82, -0.05], [0.86, 0.0], [0.8, 0.06],
-        [0.55, 0.11], [0.25, 0.15], [0, 0.16]
-    ].map(([x, y]) => new THREE.Vector2(x, y));
-    hull.add(new THREE.Mesh(new THREE.LatheGeometry(profile, 64), hullMaterial()));
-
-    const grey = solidMaterial(cPanel);
-    const dark = solidMaterial(cDark);
-
-    // Gabelbug: zwei Zinken mit Lücke dazwischen
-    for (const s of [-1, 1]) {
-        const prong = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.09, 0.2), grey);
-        prong.position.set(0.86, 0, s * 0.2);
-        hull.add(prong);
-        const tip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.1, 0.21), dark);
-        tip.position.set(NOSE - 0.02, 0, s * 0.2);
-        hull.add(tip);
-    }
-
-    // seitlich versetztes Cockpit: Röhre mit Glaskuppel vorne
-    const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.1, 0.5, 20), grey);
-    tube.rotation.z = Math.PI / 2;
-    tube.rotation.y = -0.35;
-    tube.position.set(0.48, 0.02, 0.72);
-    hull.add(tube);
-    const glass = new THREE.Mesh(new THREE.SphereGeometry(0.1, 20, 14), glassMaterial());
-    glass.position.set(0.72, 0.02, 0.81);
-    hull.add(glass);
-
-    // Radarschüssel oben, dreht sich
-    const dish = new THREE.Mesh(new THREE.SphereGeometry(0.13, 20, 8, 0, Math.PI * 2, 0, 1.0), dark);
-    dish.position.set(-0.1, 0.2, 0.32);
-    dish.rotation.x = Math.PI;
-    hull.add(dish);
-
-    // Geschützkuppel in der Mitte, Laderampe-Andeutung unten
-    const turret = new THREE.Mesh(new THREE.SphereGeometry(0.11, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2), dark);
-    turret.position.y = 0.14;
-    hull.add(turret);
-
-    // Landestützen (nur in der Seitenansicht zu sehen)
-    for (const x of [-0.45, 0.35]) {
-        const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.04, 0.08, 8), dark);
-        leg.position.set(x, -SHIP_BOTTOM + 0.04, 0);
-        hull.add(leg);
-    }
-
-    // Triebwerksbogen hinten
-    const arc = 1.7;
-    const engineGeometry = new THREE.TorusGeometry(0.82, 0.045, 8, 48, arc);
-    engineGeometry.rotateX(Math.PI / 2);
-    engineGeometry.rotateY(arc / 2 - Math.PI);
-    hull.add(new THREE.Mesh(engineGeometry, engineMaterial()));
-
-    // Abgas: eine liegende Fläche (Draufsicht) und eine stehende (Seitenansicht)
-    const plume = plumeMaterial();
-    const plumeTop = new THREE.Mesh(new THREE.PlaneGeometry(1, 1.3), plume);
-    plumeTop.rotation.x = -Math.PI / 2;
-    const plumeSide = new THREE.Mesh(new THREE.PlaneGeometry(1, 0.14), plume);
-    hull.add(plumeTop, plumeSide);
-
-    const setThrust = (value) => {
-        u.thrust.value = value;
-        const len = 0.1 + value * 1.1;
-        for (const m of [plumeTop, plumeSide]) {
-            m.scale.x = len;
-            m.position.x = -0.7 - len / 2;
-            m.visible = value > 0.01;
-        }
+    const frameOf = (index) => {
+        frameOffset.value.set((index % meta.cols) / meta.cols, 1 - (Math.floor(index / meta.cols) + 1) / meta.rows);
     };
-    setThrust(0);
 
-    const update = (dt) => { dish.rotation.y += dt * 2.5; };
+    // heading: Bugrichtung (rad, gegen den Uhrzeigersinn ab rechts), bank: -1/0/1, present: 0 = Frontansicht … 1 = Flug
+    let current = 0;
+    function pose(heading, bank, present) {
+        const step = Math.PI * 2 / meta.headings;
+        let index, rest;
+        if (present < 0.98) {
+            index = meta.pitchStart + Math.round(THREE.MathUtils.clamp(present, 0, 1) * (meta.pitchFrames - 1));
+            rest = heading - Math.PI / 2;               // Startsequenz endet mit dem Bug nach oben
+        } else {
+            const h = Math.round(heading / step);
+            index = (bank + 1) * meta.headings + ((h % meta.headings) + meta.headings) % meta.headings;
+            rest = heading - h * step;                  // Rest bis zum nächsten Bild: Quad minimal drehen
+        }
+        current = index;
+        frameOf(index);
+        mesh.rotation.z = rest;
+        // Glühen gegenüber dem Bug, in der Frontansicht verdeckt
+        glow.position.x = -Math.cos(heading) * 0.12;
+        glow.position.y = -Math.sin(heading) * 0.12;
+        glow.visible = present > 0.5;
+    }
 
-    return { ship, hull, setThrust, update };
+    // Mündung der Kanonen im aktuellen Bild (Welteinheiten relativ zur Schiffsmitte)
+    function cannon() {
+        const [x, y] = meta.cannons[current];
+        const c = Math.cos(mesh.rotation.z), s = Math.sin(mesh.rotation.z);
+        const r = SPRITE_SIZE / 2;
+        return { x: (x * c - y * s) * r, y: (x * s + y * c) * r };
+    }
+
+    return { ship, pose, cannon };
 }
 
-// Lift: Plattform (Oberkante = Ursprung) mit Ladebalken und Warnlichtern, darunter die Hubsäule
 function createLift() {
     const u = shipUniforms;
     const lift = new THREE.Group();
@@ -276,8 +193,11 @@ function spriteMaterial(kind) {
     return m;
 }
 
-export function createScene() {
-    const freighter = createFreighter();
+export async function createScene() {
+    const atlas = await new THREE.TextureLoader().loadAsync(new URL('../assets/tie.webp', import.meta.url).href);
+    atlas.colorSpace = THREE.SRGBColorSpace;
+    atlas.anisotropy = 4;
+    const tie = createTieSprite(atlas, tieMeta);
     const lift = createLift();
     const laserGeo = new THREE.PlaneGeometry(1, 1);
     const laserMat = laserMaterial();
@@ -340,5 +260,5 @@ export function createScene() {
         }
     }
 
-    return { freighter, lift, fireLaser, spawn, burst, updateEffects, clearEffects };
+    return { tie, lift, fireLaser, spawn, burst, updateEffects, clearEffects };
 }

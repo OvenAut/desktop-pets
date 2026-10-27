@@ -60,22 +60,22 @@ function createWindow() {
 }
 
 function createTray() {
-    // Kleines Raumschiff als Bitmap (BGRA), damit keine Bilddatei nötig ist
+    // Kleiner TIE-Fighter als Bitmap (BGRA), damit keine Bilddatei nötig ist
     const size = 16, buf = Buffer.alloc(size * size * 4);
     const set = (x, y, r, g, b) => {
         const i = (y * size + x) * 4;
         buf[i] = b; buf[i + 1] = g; buf[i + 2] = r; buf[i + 3] = 255;
     };
+    // TIE von vorne: |o|
+    for (let y = 1; y < 15; y++) { set(1, y, 170, 176, 186); set(2, y, 120, 126, 136); set(13, y, 120, 126, 136); set(14, y, 170, 176, 186); }
+    for (let x = 3; x < 13; x++) set(x, 8, 150, 156, 166);
     for (let y = 0; y < size; y++) {
         for (let x = 0; x < size; x++) {
-            const dx = x - 7, dy = y - 7.5;
-            if (dx * dx + dy * dy <= 30) set(x, y, 205, 208, 202);                 // Untertasse
-            if (x >= 12 && (y === 5 || y === 6 || y === 9 || y === 10)) set(x, y, 160, 166, 158);   // Gabelbug
-            if (dx * dx + dy * dy <= 30 && dx < -3 && Math.abs(dy) < 3.5) set(x, y, 95, 210, 255);  // Triebwerk
+            const dx = x - 7.5, dy = y - 8;
+            if (dx * dx + dy * dy <= 9) set(x, y, 185, 190, 198);
+            if (dx * dx + dy * dy <= 2.5) set(x, y, 40, 46, 56);
         }
     }
-    set(7, 7, 60, 64, 75); set(7, 8, 60, 64, 75);
-    set(11, 12, 63, 224, 255); set(12, 12, 63, 224, 255);   // Cockpit
     tray = new Tray(nativeImage.createFromBitmap(buf, { width: size, height: size }));
     tray.setToolTip('Raumschiff');
     tray.setContextMenu(buildMenu());
